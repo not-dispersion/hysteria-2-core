@@ -29,7 +29,6 @@ MASQ=${MASQ:-https://www.cloudflare.com}
 echo "Your Masquerade URL is: $MASQ"
 
 # installing dependencies
-echo "Installing dependencies..."
 apt update -y
 apt install -y dnsutils wget curl openssl qrencode ca-certificates certbot
 wget -O /usr/local/bin/yq \
