@@ -1,0 +1,269 @@
+#!/bin/bash
+# basic check
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "Error: Run as root."; exit 1; }
+echo "Root: OK"
+[[ -d /run/systemd/system ]] || { echo "Error: Systemd is not running."; exit 1; }
+echo "Systemd: OK"
+ss -ltn | grep -qE ':(80|443)\s' && { echo "Error: Ports 80/443 TCP are busy."; exit 1; }
+echo "Ports 80/443 TCP: OK"
+ss -lnu | grep -q ':443 ' && { echo "Error: Port 443 UDP is busy."; exit 1; }
+echo "Port 443 UDP: OK"
+
+# parameters
+read -p "Enter your domain name: " DOMAIN
+DOMAIN=$(echo "$DOMAIN" | xargs)
+echo "Your domain is: $DOMAIN"
+
+read -p "Enter your email for ACME: " EMAIL
+EMAIL=$(echo "$EMAIL" | xargs)
+echo "Your email for ACME is: $EMAIL"
+
+read -p "Enter the port for Hysteria 2 (or press Enter to use default: 443): " PORT
+PORT=${PORT:-443}
+echo "Your port for Hysteria 2 is: $PORT"
+
+read -p "Enter Masquerade URL (or press Enter to use default: https://www.cloudflare.com): " MASQ
+MASQ=${MASQ:-https://www.cloudflare.com}
+echo "Your Masquerade URL is: $MASQ"
+
+# installing dependencies
+echo "Installing dependencies..."
+apt update -y
+apt install -y dnsutils wget curl openssl qrencode ca-certificates certbot
+wget -O /usr/local/bin/yq \
+    https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+
+chmod +x /usr/local/bin/yq
+command -v yq >/dev/null || { echo "Error: yq installation failed"; exit 1; }
+
+# DNS check
+DOMAIN_IP=$(dig +short "$DOMAIN" | head -n1)
+SERVER_IP=$(curl -4 -s icanhazip.com)
+echo "Domain A-record: $DOMAIN_IP"
+echo "Server IP: $SERVER_IP"
+[[ "$DOMAIN_IP" == "$SERVER_IP" ]] || {
+    echo "Error: A-record and server IP don't match, ACME won't work.";
+    exit 1;
+}
+echo "DNS check: OK"
+
+# obtain SSL certificate via certbot
+echo "Obtaining SSL certificate via certbot..."
+certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" || {
+    echo "Error: Failed to obtain SSL certificate";
+    echo "Make sure port 80 is accessible from the internet";
+    exit 1;
+}
+echo "SSL certificate obtained: OK"
+
+# installing Hysteria 2 itself (latest release)
+echo "Installing Hysteria 2..."
+curl -L -o /usr/local/bin/hysteria \
+    https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
+chmod +x /usr/local/bin/hysteria
+
+hysteria version
+echo "Hysteria 2 installation: OK"
+
+# creating config.yaml
+mkdir -p /etc/hysteria
+
+cat > /etc/hysteria/config.yaml <<EOF
+listen: ":$PORT"
+
+tls:
+  cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
+  key: /etc/letsencrypt/live/$DOMAIN/privkey.pem
+  alpn:
+    - h3
+
+auth:
+  type: userpass
+  userpass: {}
+
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+
+bandwidth:
+  up: 1 gbps
+  down: 1 gbps
+
+masquerade:
+  type: proxy
+  proxy:
+    url: $MASQ
+    rewriteHost: true
+EOF
+
+echo "Configuration for Hysteria 2 saved in: /etc/hysteria/config.yaml"
+
+# creating the first user
+echo ""
+read -p "Create first user - Enter username: " FIRST_USER
+FIRST_USER=$(echo "$FIRST_USER" | xargs)
+[[ ! "$FIRST_USER" =~ ^[a-zA-Z0-9_-]+$ ]] && {
+    echo "Error: Username can contain only letters, numbers, _ and -";
+    exit 1;
+}
+FIRST_PASS=$(openssl rand -hex 16)
+yq e -i ".auth.userpass[\"$FIRST_USER\"] = \"$FIRST_PASS\"" /etc/hysteria/config.yaml
+
+echo "First user created: $FIRST_USER"
+echo "Password: $FIRST_PASS"
+echo ""
+
+# setting Hysteria 2 as systemd unit
+cat > /etc/systemd/system/hysteria-server.service <<EOF
+[Unit]
+Description=Hysteria 2 Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl start hysteria-server
+systemctl status hysteria-server
+
+echo "Hysteria systemd unit installed and started"
+
+# setup certbot auto-renewal hook
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/hysteria-reload.sh <<'EOF'
+#!/bin/bash
+systemctl reload-or-restart hysteria-server
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/hysteria-reload.sh
+echo "Certbot auto-renewal hook configured"
+
+# quick health Check
+echo "Waiting 5 seconds for Hysteria to start..."
+sleep 5
+
+systemctl is-active --quiet hysteria-server || {
+    echo "Error: Hysteria 2 service is not active!";
+    echo "";
+    echo "Service Status:";
+    systemctl status hysteria-server --no-pager;
+    echo "";
+    echo "Recent Logs:";
+    journalctl -u hysteria-server -n 50 --no-pager;
+    exit 1;
+}
+echo "Hysteria 2 service is running: OK"
+
+ss -lnu | grep -q ":$PORT " || {
+    echo "Error: UDP port $PORT is not listening!";
+    exit 1;
+}
+echo "UDP port $PORT listening: OK"
+
+# adding management scripts
+
+# userlist
+cat > /usr/local/bin/userlist <<'EOF'
+#!/bin/bash
+CONFIG=/etc/hysteria/config.yaml
+mapfile -t USERS < <(yq e '.auth.userpass | keys // [] | .[]' "$CONFIG")
+[[ ${#USERS[@]} -eq 0 ]] && { echo "Client list is empty."; exit 0; }
+for i in "${!USERS[@]}"; do echo "$((i+1)). ${USERS[$i]}"; done
+EOF
+chmod +x /usr/local/bin/userlist
+
+# newuser
+cat > /usr/local/bin/newuser <<'EOF'
+#!/bin/bash
+CONFIG=/etc/hysteria/config.yaml
+read -p "Enter username: " USERNAME
+USERNAME=$(echo "$USERNAME" | xargs)
+[[ ! "$USERNAME" =~ ^[a-zA-Z0-9_-]+$ ]] && {
+    echo "Error: Username can contain only letters, numbers, _ and -";
+    exit 1;
+}
+exists=$(yq e ".auth.userpass[\"$USERNAME\"]" "$CONFIG")
+[[ "$exists" != "null" ]] && { echo "User exists"; exit 1; }
+PASSWORD=$(openssl rand -hex 16)
+yq e -i ".auth.userpass[\"$USERNAME\"] = \"$PASSWORD\"" "$CONFIG"
+systemctl restart hysteria-server
+sleep 2
+systemctl is-active --quiet hysteria-server || {
+    echo "Error: Service failed to restart.";
+    exit 1;
+}
+DOMAIN=$(yq e '.tls.cert' "$CONFIG" | sed 's|/etc/letsencrypt/live/||' | sed 's|/fullchain.pem||')
+PORT=$(yq e '.listen' "$CONFIG" | sed 's/.*://')
+link="hysteria2://$USERNAME:$PASSWORD@$DOMAIN:$PORT/?insecure=0&sni=$DOMAIN&alpn=h3#$USERNAME"
+echo ""; echo "Connection link:"; echo "$link"; echo ""; echo "$link" | qrencode -t ansiutf8
+EOF
+sudo chmod +x /usr/local/bin/newuser
+
+# rmuser
+cat > /usr/local/bin/rmuser <<'EOF'
+#!/bin/bash
+CONFIG=/etc/hysteria/config.yaml
+USERS=($(yq e '.auth.userpass // {} | keys | .[]' "$CONFIG"))
+[[ ${#USERS[@]} -eq 0 ]] && { echo "No clients"; exit 0; }
+for i in "${!USERS[@]}"; do echo "$((i+1)). ${USERS[$i]}"; done
+read -p "Select user number to remove: " num
+[[ "$num" =~ ^[0-9]+$ ]] || { echo "Invalid"; exit 1; }
+(( num>=1 && num<=${#USERS[@]} )) || { echo "Invalid"; exit 1; }
+user=${USERS[$((num-1))]}
+yq e -i "del(.auth.userpass[\"$user\"])" "$CONFIG"
+systemctl restart hysteria-server
+sleep 2
+systemctl is-active --quiet hysteria-server || {
+    echo "Error: Service failed to restart.";
+    exit 1;
+}
+echo "Removed user: $user"
+EOF
+chmod +x /usr/local/bin/rmuser
+
+# sharelink
+cat > /usr/local/bin/sharelink <<'EOF'
+#!/bin/bash
+CONFIG=/etc/hysteria/config.yaml
+USERS=($(yq e '.auth.userpass | keys | .[]' "$CONFIG"))
+[[ ${#USERS[@]} -eq 0 ]] && { echo "No clients"; exit 0; }
+for i in "${!USERS[@]}"; do echo "$((i+1)). ${USERS[$i]}"; done
+read -p "Select user number: " num
+[[ "$num" =~ ^[0-9]+$ ]] || { echo "Invalid"; exit 1; }
+(( num>=1 && num<=${#USERS[@]} )) || { echo "Invalid"; exit 1; }
+USER=${USERS[$((num-1))]}
+USER=$(echo "$USER" | xargs)
+PASSWORD=$(yq e ".auth.userpass[\"$USER\"]" "$CONFIG")
+DOMAIN=$(yq e '.tls.cert' "$CONFIG" | sed 's|/etc/letsencrypt/live/||' | sed 's|/fullchain.pem||')
+PORT=$(yq e '.listen' "$CONFIG" | sed 's/://')
+link="hysteria2://$USER:$PASSWORD@$DOMAIN:$PORT/?insecure=0&sni=$DOMAIN&alpn=h3#$USER"
+echo ""; echo "Connection link:"; echo "$link"; echo ""; echo "$link" | qrencode -t ansiutf8
+EOF
+sudo chmod +x /usr/local/bin/sharelink
+echo "Management scripts installed: OK"
+
+echo ""
+echo "Certificate will auto-renew via certbot."
+echo "============================================"
+echo "Hysteria 2 installation completed!"
+echo "============================================"
+echo "Use these commands to manage users:"
+echo "  newuser    - Add a new user"
+echo "  userlist   - List all users"
+echo "  rmuser     - Remove a user"
+echo "  sharelink  - Get connection link for existing user"
+echo ""
+echo "IMPORTANT! Run these management commands with root privileges (sudo) fot them to work correctly."
+echo "============================================"
